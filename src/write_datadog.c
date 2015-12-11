@@ -1,8 +1,6 @@
 /**
- * collectd - src/write_http.c
- * Copyright (C) 2009       Paul Sadauskas
- * Copyright (C) 2009       Doug MacEachern
- * Copyright (C) 2007-2014  Florian octo Forster
+ * collectd - src/write_datadog.c
+ * Copyright (C) 2015 Datadog
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -29,59 +27,335 @@
 #include "utils_cache.h"
 #include "utils_format_json.h"
 
+#include "string.h"
+
 #if HAVE_PTHREAD_H
 # include <pthread.h>
 #endif
 
 #include <curl/curl.h>
 
-#ifndef WRITE_HTTP_DEFAULT_BUFFER_SIZE
-# define WRITE_HTTP_DEFAULT_BUFFER_SIZE 4096
+#ifndef WRITE_DATADOG_DEFAULT_BUFFER_SIZE
+# define WRITE_DATADOG_DEFAULT_BUFFER_SIZE 4096
 #endif
+
+#define PLUGIN_NAME "write_datadog"
+#define DD_BASE_URL "https://app.datadoghq.com/api/v1"
+
+#define DD_MAX_TAG_LEN 255
 
 /*
  * Private variables
  */
-struct wh_callback_s
+struct wdog_callback_s
 {
-        char *name;
+        char     *name;
 
-        char *location;
-        char *user;
-        char *pass;
-        char *credentials;
-        _Bool verify_peer;
-        _Bool verify_host;
-        char *cacert;
-        char *capath;
-        char *clientkey;
-        char *clientcert;
-        char *clientkeypass;
-        long sslversion;
-        _Bool store_rates;
-        _Bool log_http_error;
-        int   low_speed_limit;
-        time_t low_speed_time;
-        int timeout;
+        //DD specific
+        char     *endpoint;
+        char     *api_key;
+        int      n_tags;
+        char     *tags; //probably should be **
+        _Bool    element_tag;
 
-#define WH_FORMAT_COMMAND 0
-#define WH_FORMAT_JSON    1
-        int format;
+        //CURL OPTS
+        _Bool    verify_peer;
+        _Bool    verify_host;
+        char     *cacert;
+        char     *capath;
+        char     *clientkey;
+        char     *clientcert;
+        char     *clientkeypass;
+        long     sslversion;
+        int      low_speed_limit;
+        time_t   low_speed_time;
 
-        CURL *curl;
-        char curl_errbuf[CURL_ERROR_SIZE];
+        _Bool    log_http_error;
+        int      timeout;
 
-        char  *send_buffer;
-        size_t send_buffer_size;
-        size_t send_buffer_free;
-        size_t send_buffer_fill;
+        CURL     *curl;
+        char     curl_errbuf[CURL_ERROR_SIZE];
+
+        char     *send_buffer;
+        size_t   send_buffer_size;
+        size_t   send_buffer_free;
+        size_t   send_buffer_fill;
         cdtime_t send_buffer_init_time;
 
         pthread_mutex_t send_lock;
 };
-typedef struct wh_callback_s wh_callback_t;
+typedef struct wdog_callback_s wdog_callback_t;
 
-static void wh_log_http_error (wh_callback_t *cb)
+
+//JSON Stuff
+static int dd_json_escape_string (char *buffer, size_t buffer_size, /* {{{ */
+    const char *string)
+{
+  size_t src_pos;
+  size_t dst_pos;
+
+  if ((buffer == NULL) || (string == NULL))
+    return (-EINVAL);
+
+  if (buffer_size < 3)
+    return (-ENOMEM);
+
+  dst_pos = 0;
+
+#define BUFFER_ADD(c) do { \
+  if (dst_pos >= (buffer_size - 1)) { \
+    buffer[buffer_size - 1] = 0; \
+    return (-ENOMEM); \
+  } \
+  buffer[dst_pos] = (c); \
+  dst_pos++; \
+} while (0)
+
+  /* Escape special characters */
+  BUFFER_ADD ('"');
+  for (src_pos = 0; string[src_pos] != 0; src_pos++)
+  {
+    if ((string[src_pos] == '"')
+        || (string[src_pos] == '\\'))
+    {
+      BUFFER_ADD ('\\');
+      BUFFER_ADD (string[src_pos]);
+    }
+    else if (string[src_pos] <= 0x001F)
+      BUFFER_ADD ('?');
+    else
+      BUFFER_ADD (string[src_pos]);
+  } /* for */
+  BUFFER_ADD ('"');
+  buffer[dst_pos] = 0;
+
+#undef BUFFER_ADD
+
+  return (0);
+} /* }}} int dd_json_escape_string */
+
+static int values_to_json (char *buffer, size_t buffer_size, /* {{{ */
+                const data_set_t *ds, const value_list_t *vl, int store_rates)
+{
+  size_t offset = 0;
+  size_t i;
+  gauge_t *rates = NULL;
+
+  memset (buffer, 0, buffer_size);
+
+#define BUFFER_ADD(...) do { \
+  int status; \
+  status = ssnprintf (buffer + offset, buffer_size - offset, \
+      __VA_ARGS__); \
+  if (status < 1) \
+  { \
+    sfree(rates); \
+    return (-1); \
+  } \
+  else if (((size_t) status) >= (buffer_size - offset)) \
+  { \
+    sfree(rates); \
+    return (-ENOMEM); \
+  } \
+  else \
+    offset += ((size_t) status); \
+} while (0)
+
+  BUFFER_ADD ("[");
+  for (i = 0; i < ds->ds_num; i++)
+  {
+    if (i > 0)
+      BUFFER_ADD (",");
+
+    if (ds->ds[i].type == DS_TYPE_GAUGE)
+    {
+      if(isfinite (vl->values[i].gauge))
+        BUFFER_ADD (JSON_GAUGE_FORMAT, vl->values[i].gauge);
+      else
+        BUFFER_ADD ("null");
+    }
+    else if (store_rates)
+    {
+      if (rates == NULL)
+        rates = uc_get_rate (ds, vl);
+      if (rates == NULL)
+      {
+        WARNING ("utils_format_json: uc_get_rate failed.");
+        sfree(rates);
+        return (-1);
+      }
+
+      if(isfinite (rates[i]))
+        BUFFER_ADD (JSON_GAUGE_FORMAT, rates[i]);
+      else
+        BUFFER_ADD ("null");
+    }
+    else if (ds->ds[i].type == DS_TYPE_COUNTER)
+      BUFFER_ADD ("%llu", vl->values[i].counter);
+    else if (ds->ds[i].type == DS_TYPE_DERIVE)
+      BUFFER_ADD ("%"PRIi64, vl->values[i].derive);
+    else if (ds->ds[i].type == DS_TYPE_ABSOLUTE)
+      BUFFER_ADD ("%"PRIu64, vl->values[i].absolute);
+    else
+    {
+      ERROR ("format_json: Unknown data source type: %i",
+          ds->ds[i].type);
+      sfree (rates);
+      return (-1);
+    }
+  } /* for ds->ds_num */
+  BUFFER_ADD ("]");
+
+#undef BUFFER_ADD
+
+  DEBUG ("format_json: values_to_json: buffer = %s;", buffer);
+  sfree(rates);
+  return (0);
+} /* }}} int values_to_json */
+
+static int value_list_to_json (char *buffer, size_t buffer_size, /* {{{ */
+                const data_set_t *ds, const value_list_t *vl, int store_rates)
+{
+  char temp[512];
+  size_t offset = 0;
+  int status;
+
+  memset (buffer, 0, buffer_size);
+
+#define BUFFER_ADD(...) do { \
+  status = ssnprintf (buffer + offset, buffer_size - offset, \
+      __VA_ARGS__); \
+  if (status < 1) \
+    return (-1); \
+  else if (((size_t) status) >= (buffer_size - offset)) \
+    return (-ENOMEM); \
+  else \
+    offset += ((size_t) status); \
+} while (0)
+
+  /* All value lists have a leading comma. The first one will be replaced with
+   * a square bracket in `format_dd_json_finalize'. */
+  BUFFER_ADD (",{");
+
+  status = extract_ddmetric_to_json (temp, sizeof (temp), ds);
+  if (status != 0)
+    return (status);
+  BUFFER_ADD ("\"metric\":%s", temp);
+
+  status = extract_ddpoints_to_json (temp, sizeof (temp), ds, vl, store_rates);
+  if (status != 0)
+    return (status);
+  BUFFER_ADD ("\"points\":%s", temp);
+
+  status = extract_ddtypes_to_json (temp, sizeof (temp), ds);
+  if (status != 0)
+    return (status);
+  BUFFER_ADD ("\"type\":%s", temp);
+
+  BUFFER_ADD_KEYVAL ("host", vl->host);
+
+  status = extract_ddtags_to_json (temp, sizeof (temp), ds);
+  if (status != 0)
+    return (status);
+  BUFFER_ADD ("\"tags\":%s", temp);
+
+
+#if 0
+  status = values_to_json (temp, sizeof (temp), ds, vl, store_rates);
+  if (status != 0)
+    return (status);
+  BUFFER_ADD ("\"values\":%s", temp);
+
+  status = dstypes_to_json (temp, sizeof (temp), ds);
+  if (status != 0)
+    return (status);
+  BUFFER_ADD (",\"dstypes\":%s", temp);
+
+  status = dsnames_to_json (temp, sizeof (temp), ds);
+  if (status != 0)
+    return (status);
+  BUFFER_ADD (",\"dsnames\":%s", temp);
+
+  BUFFER_ADD (",\"time\":%.3f", CDTIME_T_TO_DOUBLE (vl->time));
+  BUFFER_ADD (",\"interval\":%.3f", CDTIME_T_TO_DOUBLE (vl->interval));
+
+#define BUFFER_ADD_KEYVAL(key, value) do { \
+  status = dd_json_escape_string (temp, sizeof (temp), (value)); \
+  if (status != 0) \
+    return (status); \
+  BUFFER_ADD (",\"%s\":%s", (key), temp); \
+} while (0)
+
+  BUFFER_ADD_KEYVAL ("host", vl->host);
+  BUFFER_ADD_KEYVAL ("plugin", vl->plugin);
+  BUFFER_ADD_KEYVAL ("plugin_instance", vl->plugin_instance);
+  BUFFER_ADD_KEYVAL ("type", vl->type);
+  BUFFER_ADD_KEYVAL ("type_instance", vl->type_instance);
+#endif
+
+#if 0
+  if (vl->meta != NULL)
+  {
+    char meta_buffer[buffer_size];
+    memset (meta_buffer, 0, sizeof (meta_buffer));
+    status = meta_data_to_json (meta_buffer, sizeof (meta_buffer), vl->meta);
+    if (status != 0)
+      return (status);
+
+    BUFFER_ADD (",\"meta\":%s", meta_buffer);
+  } /* if (vl->meta != NULL) */
+#endif
+
+  BUFFER_ADD ("}");
+
+#undef BUFFER_ADD_KEYVAL
+#undef BUFFER_ADD
+
+  DEBUG ("format_json: value_list_to_json: buffer = %s;", buffer);
+
+  return (0);
+} /* }}} int value_list_to_json */
+
+static int format_dd_json_value_list_nocheck (char *buffer, /* {{{ */
+    size_t *ret_buffer_fill, size_t *ret_buffer_free,
+    const data_set_t *ds, const value_list_t *vl,
+    int store_rates, size_t temp_size)
+{
+  char temp[temp_size];
+  int status;
+
+  status = value_list_to_json (temp, sizeof (temp), ds, vl, store_rates);
+  if (status != 0)
+    return (status);
+  temp_size = strlen (temp);
+
+  memcpy (buffer + (*ret_buffer_fill), temp, temp_size + 1);
+  (*ret_buffer_fill) += temp_size;
+  (*ret_buffer_free) -= temp_size;
+
+  return (0);
+} /* }}} int format_dd_json_value_list_nocheck */
+
+int format_dd_json_value_list (char *buffer, /* {{{ */
+    size_t *ret_buffer_fill, size_t *ret_buffer_free,
+    const data_set_t *ds, const value_list_t *vl, int store_rates)
+{
+  if ((buffer == NULL)
+      || (ret_buffer_fill == NULL) || (ret_buffer_free == NULL)
+      || (ds == NULL) || (vl == NULL))
+    return (-EINVAL);
+
+  if (*ret_buffer_free < 3)
+    return (-ENOMEM);
+
+  return (format_dd_json_value_list_nocheck (buffer,
+        ret_buffer_fill, ret_buffer_free, ds, vl,
+        store_rates, (*ret_buffer_free) - 2));
+} /* }}} int format_dd_json_value_list */
+
+
+
+static void wdog_log_http_error (wdog_callback_t *cb)
 {
         if (!cb->log_http_error)
                 return;
@@ -91,43 +365,40 @@ static void wh_log_http_error (wh_callback_t *cb)
         curl_easy_getinfo (cb->curl, CURLINFO_RESPONSE_CODE, &http_code);
 
         if (http_code != 200)
-                INFO ("write_http plugin: HTTP Error code: %lu", http_code);
+                INFO (PLUGIN_NAME " plugin: HTTP Error code: %lu", http_code);
 }
 
-static void wh_reset_buffer (wh_callback_t *cb)  /* {{{ */
+static void wdog_reset_buffer (wdog_callback_t *cb)  /* {{{ */
 {
         memset (cb->send_buffer, 0, cb->send_buffer_size);
         cb->send_buffer_free = cb->send_buffer_size;
         cb->send_buffer_fill = 0;
         cb->send_buffer_init_time = cdtime ();
 
-        if (cb->format == WH_FORMAT_JSON)
-        {
-                format_json_initialize (cb->send_buffer,
-                                &cb->send_buffer_fill,
-                                &cb->send_buffer_free);
-        }
-} /* }}} wh_reset_buffer */
+        format_json_initialize (cb->send_buffer,
+                        &cb->send_buffer_fill,
+                        &cb->send_buffer_free);
+} /* }}} wdog_reset_buffer */
 
-static int wh_send_buffer (wh_callback_t *cb) /* {{{ */
+static int wdog_send_buffer (wdog_callback_t *cb) /* {{{ */
 {
         int status = 0;
 
         curl_easy_setopt (cb->curl, CURLOPT_POSTFIELDS, cb->send_buffer);
         status = curl_easy_perform (cb->curl);
 
-        wh_log_http_error (cb);
+        wdog_log_http_error (cb);
 
         if (status != CURLE_OK)
         {
-                ERROR ("write_http plugin: curl_easy_perform failed with "
+                ERROR (PLUGIN_NAME " plugin: curl_easy_perform failed with "
                                 "status %i: %s",
                                 status, cb->curl_errbuf);
         }
         return (status);
-} /* }}} wh_send_buffer */
+} /* }}} wdog_send_buffer */
 
-static int wh_callback_init (wh_callback_t *cb) /* {{{ */
+static int wdog_callback_init (wdog_callback_t *cb) /* {{{ */
 {
         struct curl_slist *headers;
 
@@ -159,15 +430,12 @@ static int wh_callback_init (wh_callback_t *cb) /* {{{ */
 
         headers = NULL;
         headers = curl_slist_append (headers, "Accept:  */*");
-        if (cb->format == WH_FORMAT_JSON)
-                headers = curl_slist_append (headers, "Content-Type: application/json");
-        else
-                headers = curl_slist_append (headers, "Content-Type: text/plain");
+        headers = curl_slist_append (headers, "Content-Type: application/json");
         headers = curl_slist_append (headers, "Expect:");
         curl_easy_setopt (cb->curl, CURLOPT_HTTPHEADER, headers);
 
         curl_easy_setopt (cb->curl, CURLOPT_ERRORBUFFER, cb->curl_errbuf);
-        curl_easy_setopt (cb->curl, CURLOPT_URL, cb->location);
+        curl_easy_setopt (cb->curl, CURLOPT_URL, cb->endpoint);
         curl_easy_setopt (cb->curl, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt (cb->curl, CURLOPT_MAXREDIRS, 50L);
 
@@ -216,16 +484,16 @@ static int wh_callback_init (wh_callback_t *cb) /* {{{ */
                 curl_easy_setopt (cb->curl, CURLOPT_SSLKEYPASSWD, cb->clientkeypass);
         }
 
-        wh_reset_buffer (cb);
+        wdog_reset_buffer (cb);
 
         return (0);
-} /* }}} int wh_callback_init */
+} /* }}} int wdog_callback_init */
 
-static int wh_flush_nolock (cdtime_t timeout, wh_callback_t *cb) /* {{{ */
+static int wdog_flush_nolock (cdtime_t timeout, wdog_callback_t *cb) /* {{{ */
 {
         int status;
 
-        DEBUG ("write_http plugin: wh_flush_nolock: timeout = %.3f; "
+        DEBUG (PLUGIN_NAME " plugin: wdog_flush_nolock: timeout = %.3f; "
                         "send_buffer_fill = %zu;",
                         CDTIME_T_TO_DOUBLE (timeout),
                         cb->send_buffer_fill);
@@ -240,55 +508,34 @@ static int wh_flush_nolock (cdtime_t timeout, wh_callback_t *cb) /* {{{ */
                         return (0);
         }
 
-        if (cb->format == WH_FORMAT_COMMAND)
+        if (cb->send_buffer_fill <= 2)
         {
-                if (cb->send_buffer_fill <= 0)
-                {
-                        cb->send_buffer_init_time = cdtime ();
-                        return (0);
-                }
-
-                status = wh_send_buffer (cb);
-                wh_reset_buffer (cb);
+                cb->send_buffer_init_time = cdtime ();
+                return (0);
         }
-        else if (cb->format == WH_FORMAT_JSON)
+
+        status = format_json_finalize (cb->send_buffer,
+                        &cb->send_buffer_fill,
+                        &cb->send_buffer_free);
+        if (status != 0)
         {
-                if (cb->send_buffer_fill <= 2)
-                {
-                        cb->send_buffer_init_time = cdtime ();
-                        return (0);
-                }
-
-                status = format_json_finalize (cb->send_buffer,
-                                &cb->send_buffer_fill,
-                                &cb->send_buffer_free);
-                if (status != 0)
-                {
-                        ERROR ("write_http: wh_flush_nolock: "
-                                        "format_json_finalize failed.");
-                        wh_reset_buffer (cb);
-                        return (status);
-                }
-
-                status = wh_send_buffer (cb);
-                wh_reset_buffer (cb);
+                ERROR ("write_datadog: wdog_flush_nolock: "
+                                "format_json_finalize failed.");
+                wdog_reset_buffer (cb);
+                return (status);
         }
-        else
-        {
-                ERROR ("write_http: wh_flush_nolock: "
-                                "Unknown format: %i",
-                                cb->format);
-                return (-1);
-        }
+
+        status = wdog_send_buffer (cb);
+        wdog_reset_buffer (cb);
 
         return (status);
-} /* }}} wh_flush_nolock */
+} /* }}} wdog_flush_nolock */
 
-static int wh_flush (cdtime_t timeout, /* {{{ */
+static int wdog_flush (cdtime_t timeout, /* {{{ */
                 const char *identifier __attribute__((unused)),
                 user_data_t *user_data)
 {
-        wh_callback_t *cb;
+        wdog_callback_t *cb;
         int status;
 
         if (user_data == NULL)
@@ -300,31 +547,31 @@ static int wh_flush (cdtime_t timeout, /* {{{ */
 
         if (cb->curl == NULL)
         {
-                status = wh_callback_init (cb);
+                status = wdog_callback_init (cb);
                 if (status != 0)
                 {
-                        ERROR ("write_http plugin: wh_callback_init failed.");
+                        ERROR (PLUGIN_NAME " plugin: wdog_callback_init failed.");
                         pthread_mutex_unlock (&cb->send_lock);
                         return (-1);
                 }
         }
 
-        status = wh_flush_nolock (timeout, cb);
+        status = wdog_flush_nolock (timeout, cb);
         pthread_mutex_unlock (&cb->send_lock);
 
         return (status);
-} /* }}} int wh_flush */
+} /* }}} int wdog_flush */
 
-static void wh_callback_free (void *data) /* {{{ */
+static void wdog_callback_free (void *data) /* {{{ */
 {
-        wh_callback_t *cb;
+        wdog_callback_t *cb;
 
         if (data == NULL)
                 return;
 
         cb = data;
 
-        wh_flush_nolock (/* timeout = */ 0, cb);
+        wdog_flush_nolock (/* timeout = */ 0, cb);
 
         if (cb->curl != NULL)
         {
@@ -332,7 +579,7 @@ static void wh_callback_free (void *data) /* {{{ */
                 cb->curl = NULL;
         }
         sfree (cb->name);
-        sfree (cb->location);
+        sfree (cb->endpoint);
         sfree (cb->user);
         sfree (cb->pass);
         sfree (cb->credentials);
@@ -344,10 +591,10 @@ static void wh_callback_free (void *data) /* {{{ */
         sfree (cb->send_buffer);
 
         sfree (cb);
-} /* }}} void wh_callback_free */
+} /* }}} void wdog_callback_free */
 
-static int wh_write_command (const data_set_t *ds, const value_list_t *vl, /* {{{ */
-                wh_callback_t *cb)
+static int wdog_write_command (const data_set_t *ds, const value_list_t *vl, /* {{{ */
+                wdog_callback_t *cb)
 {
         char key[10*DATA_MAX_NAME_LEN];
         char values[512];
@@ -357,7 +604,7 @@ static int wh_write_command (const data_set_t *ds, const value_list_t *vl, /* {{
         int status;
 
         if (0 != strcmp (ds->type, vl->type)) {
-                ERROR ("write_http plugin: DS type does not match "
+                ERROR (PLUGIN_NAME " plugin: DS type does not match "
                                 "value list type");
                 return -1;
         }
@@ -365,7 +612,7 @@ static int wh_write_command (const data_set_t *ds, const value_list_t *vl, /* {{
         /* Copy the identifier to `key' and escape it. */
         status = FORMAT_VL (key, sizeof (key), vl);
         if (status != 0) {
-                ERROR ("write_http plugin: error with format_name");
+                ERROR (PLUGIN_NAME " plugin: error with format_name");
                 return (status);
         }
         escape_string (key, sizeof (key));
@@ -374,8 +621,8 @@ static int wh_write_command (const data_set_t *ds, const value_list_t *vl, /* {{
          * `values'. */
         status = format_values (values, sizeof (values), ds, vl, cb->store_rates);
         if (status != 0) {
-                ERROR ("write_http plugin: error with "
-                                "wh_value_list_to_string");
+                ERROR (PLUGIN_NAME " plugin: error with "
+                                "wdog_value_list_to_string");
                 return (status);
         }
 
@@ -385,7 +632,7 @@ static int wh_write_command (const data_set_t *ds, const value_list_t *vl, /* {{
                         CDTIME_T_TO_DOUBLE (vl->interval),
                         values);
         if (command_len >= sizeof (command)) {
-                ERROR ("write_http plugin: Command buffer too small: "
+                ERROR (PLUGIN_NAME " plugin: Command buffer too small: "
                                 "Need %zu bytes.", command_len + 1);
                 return (-1);
         }
@@ -394,10 +641,10 @@ static int wh_write_command (const data_set_t *ds, const value_list_t *vl, /* {{
 
         if (cb->curl == NULL)
         {
-                status = wh_callback_init (cb);
+                status = wdog_callback_init (cb);
                 if (status != 0)
                 {
-                        ERROR ("write_http plugin: wh_callback_init failed.");
+                        ERROR (PLUGIN_NAME " plugin: wdog_callback_init failed.");
                         pthread_mutex_unlock (&cb->send_lock);
                         return (-1);
                 }
@@ -405,7 +652,7 @@ static int wh_write_command (const data_set_t *ds, const value_list_t *vl, /* {{
 
         if (command_len >= cb->send_buffer_free)
         {
-                status = wh_flush_nolock (/* timeout = */ 0, cb);
+                status = wdog_flush_nolock (/* timeout = */ 0, cb);
                 if (status != 0)
                 {
                         pthread_mutex_unlock (&cb->send_lock);
@@ -421,8 +668,8 @@ static int wh_write_command (const data_set_t *ds, const value_list_t *vl, /* {{
         cb->send_buffer_fill += command_len;
         cb->send_buffer_free -= command_len;
 
-        DEBUG ("write_http plugin: <%s> buffer %zu/%zu (%g%%) \"%s\"",
-                        cb->location,
+        DEBUG (PLUGIN_NAME " plugin: <%s> buffer %zu/%zu (%g%%) \"%s\"",
+                        cb->endpoint,
                         cb->send_buffer_fill, cb->send_buffer_size,
                         100.0 * ((double) cb->send_buffer_fill) / ((double) cb->send_buffer_size),
                         command);
@@ -431,10 +678,10 @@ static int wh_write_command (const data_set_t *ds, const value_list_t *vl, /* {{
         pthread_mutex_unlock (&cb->send_lock);
 
         return (0);
-} /* }}} int wh_write_command */
+} /* }}} int wdog_write_command */
 
-static int wh_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{ */
-                wh_callback_t *cb)
+static int wdog_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{ */
+                wdog_callback_t *cb)
 {
         int status;
 
@@ -442,30 +689,30 @@ static int wh_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{ *
 
         if (cb->curl == NULL)
         {
-                status = wh_callback_init (cb);
+                status = wdog_callback_init (cb);
                 if (status != 0)
                 {
-                        ERROR ("write_http plugin: wh_callback_init failed.");
+                        ERROR (PLUGIN_NAME " plugin: wdog_callback_init failed.");
                         pthread_mutex_unlock (&cb->send_lock);
                         return (-1);
                 }
         }
 
-        status = format_json_value_list (cb->send_buffer,
+        status = format_dd_json_value_list (cb->send_buffer,
                         &cb->send_buffer_fill,
                         &cb->send_buffer_free,
                         ds, vl, cb->store_rates);
         if (status == (-ENOMEM))
         {
-                status = wh_flush_nolock (/* timeout = */ 0, cb);
+                status = wdog_flush_nolock (/* timeout = */ 0, cb);
                 if (status != 0)
                 {
-                        wh_reset_buffer (cb);
+                        wdog_reset_buffer (cb);
                         pthread_mutex_unlock (&cb->send_lock);
                         return (status);
                 }
 
-                status = format_json_value_list (cb->send_buffer,
+                status = format_dd_json_value_list (cb->send_buffer,
                                 &cb->send_buffer_fill,
                                 &cb->send_buffer_free,
                                 ds, vl, cb->store_rates);
@@ -476,8 +723,8 @@ static int wh_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{ *
                 return (status);
         }
 
-        DEBUG ("write_http plugin: <%s> buffer %zu/%zu (%g%%)",
-                        cb->location,
+        DEBUG (PLUGIN_NAME " plugin: <%s> buffer %zu/%zu (%g%%)",
+                        cb->endpoint,
                         cb->send_buffer_fill, cb->send_buffer_size,
                         100.0 * ((double) cb->send_buffer_fill) / ((double) cb->send_buffer_size));
 
@@ -485,96 +732,97 @@ static int wh_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{ *
         pthread_mutex_unlock (&cb->send_lock);
 
         return (0);
-} /* }}} int wh_write_json */
+} /* }}} int wdog_write_json */
 
-static int wh_write (const data_set_t *ds, const value_list_t *vl, /* {{{ */
+static int wdog_write (const data_set_t *ds, const value_list_t *vl, /* {{{ */
                 user_data_t *user_data)
 {
-        wh_callback_t *cb;
+        wdog_callback_t *cb;
         int status;
 
         if (user_data == NULL)
                 return (-EINVAL);
 
         cb = user_data->data;
-
-        if (cb->format == WH_FORMAT_JSON)
-                status = wh_write_json (ds, vl, cb);
-        else
-                status = wh_write_command (ds, vl, cb);
+        status = wdog_write_json (ds, vl, cb);
 
         return (status);
-} /* }}} int wh_write */
+} /* }}} int wdog_write */
 
-static int config_set_format (wh_callback_t *cb, /* {{{ */
-                oconfig_item_t *ci)
+
+static int config_set_tags (wdog_callback_t *cb, char *tag_str)
 {
-        char *string;
+        char *tags = NULL, *tok = NULL;
+        int n = 0;
 
-        if ((ci->values_num != 1)
-                        || (ci->values[0].type != OCONFIG_TYPE_STRING))
-        {
-                WARNING ("write_http plugin: The `%s' config option "
-                                "needs exactly one string argument.", ci->key);
-                return (-1);
+        tags = strdup(tag_str);
+
+        while((tok = strsep(&tags,", "))) {
+                n++;
+        }
+        cb->n_tags = n;
+        free(tags);
+
+        if (!(cb->tags = malloc(n*sizeof(char *)))) {
+                cb->tags = NULL;
+                return -1; //FIX: create error codes
         }
 
-        string = ci->values[0].value.string;
-        if (strcasecmp ("Command", string) == 0)
-                cb->format = WH_FORMAT_COMMAND;
-        else if (strcasecmp ("JSON", string) == 0)
-                cb->format = WH_FORMAT_JSON;
-        else
-        {
-                ERROR ("write_http plugin: Invalid format string: %s",
-                                string);
-                return (-1);
+        tags = strdup(tag_str);
+        n = 0;
+        while((tok = strsep(&tags,", "))) {
+                cb->tags[n++] = strdup(tok);
+                return -1
         }
+        free(tags);
 
-        return (0);
-} /* }}} int config_set_format */
+        return 0;
+}
 
-static int wh_config_node (oconfig_item_t *ci) /* {{{ */
+static int wdog_config_node (oconfig_item_t *ci) /* {{{ */
 {
-        wh_callback_t *cb;
+        wdog_callback_t *cb;
         int buffer_size = 0;
         user_data_t user_data;
         char callback_name[DATA_MAX_NAME_LEN];
+        char tag_buff[DD_MAX_TAG_LEN];
         int i;
 
         cb = malloc (sizeof (*cb));
         if (cb == NULL)
         {
-                ERROR ("write_http plugin: malloc failed.");
+                ERROR (PLUGIN_NAME " plugin: malloc failed.");
                 return (-1);
         }
         memset (cb, 0, sizeof (*cb));
+        cb->tag_element = 1;
+
         cb->verify_peer = 1;
         cb->verify_host = 1;
-        cb->format = WH_FORMAT_COMMAND;
         cb->sslversion = CURL_SSLVERSION_DEFAULT;
         cb->low_speed_limit = 0;
+
         cb->timeout = 0;
         cb->log_http_error = 0;
 
         pthread_mutex_init (&cb->send_lock, /* attr = */ NULL);
 
         cf_util_get_string (ci, &cb->name);
-
-        /* FIXME: Remove this legacy mode in version 6. */
-        if (strcasecmp ("URL", ci->key) == 0)
-                cf_util_get_string (ci, &cb->location);
+        cf_util_get_string (DD_BASE_URL, &cb->endpoint);
 
         for (i = 0; i < ci->children_num; i++)
         {
                 oconfig_item_t *child = ci->children + i;
 
-                if (strcasecmp ("URL", child->key) == 0)
-                        cf_util_get_string (child, &cb->location);
-                else if (strcasecmp ("User", child->key) == 0)
-                        cf_util_get_string (child, &cb->user);
-                else if (strcasecmp ("Password", child->key) == 0)
-                        cf_util_get_string (child, &cb->pass);
+                if (strcasecmp ("API_key", child->key) == 0)
+                        cf_util_get_string (child, &cb->api_key);
+                else if (strcasecmp ("Tags", child->key) == 0){
+                        cf_util_get_string (child, &tag_buff);
+                        if(config_set_tags(cb, tag_buff)){
+                                WARNING (PLUGIN_NAME " plugin: unable to parse tags. "
+                                        "None will be reported - please check config..");
+                        }
+                }
                 else if (strcasecmp ("VerifyPeer", child->key) == 0)
                         cf_util_get_boolean (child, &cb->verify_peer);
                 else if (strcasecmp ("VerifyHost", child->key) == 0)
@@ -612,77 +860,63 @@ static int wh_config_node (oconfig_item_t *ci) /* {{{ */
                                 cb->sslversion = CURL_SSLVERSION_TLSv1_2;
 #endif
                         else
-                                ERROR ("write_http plugin: Invalid SSLVersion "
+                                ERROR (PLUGIN_NAME " plugin: Invalid SSLVersion "
                                                 "option: %s.", value);
 
                         sfree(value);
                 }
-                else if (strcasecmp ("Format", child->key) == 0)
-                        config_set_format (cb, child);
-                else if (strcasecmp ("StoreRates", child->key) == 0)
-                        cf_util_get_boolean (child, &cb->store_rates);
                 else if (strcasecmp ("BufferSize", child->key) == 0)
                         cf_util_get_int (child, &buffer_size);
-                else if (strcasecmp ("LowSpeedLimit", child->key) == 0)
-                        cf_util_get_int (child, &cb->low_speed_limit);
                 else if (strcasecmp ("Timeout", child->key) == 0)
                         cf_util_get_int (child, &cb->timeout);
                 else if (strcasecmp ("LogHttpError", child->key) == 0)
                         cf_util_get_boolean (child, &cb->log_http_error);
                 else
                 {
-                        ERROR ("write_http plugin: Invalid configuration "
+                        ERROR (PLUGIN_NAME " plugin: Invalid configuration "
                                         "option: %s.", child->key);
                 }
-        }
-
-        if (cb->location == NULL)
-        {
-                ERROR ("write_http plugin: no URL defined for instance '%s'",
-                        cb->name);
-                wh_callback_free (cb);
-                return (-1);
         }
 
         if (cb->low_speed_limit > 0)
                 cb->low_speed_time = CDTIME_T_TO_TIME_T(plugin_get_interval());
 
         /* Determine send_buffer_size. */
-        cb->send_buffer_size = WRITE_HTTP_DEFAULT_BUFFER_SIZE;
+        cb->send_buffer_size = WRITE_DATADOG_DEFAULT_BUFFER_SIZE;
         if (buffer_size >= 1024)
                 cb->send_buffer_size = (size_t) buffer_size;
         else if (buffer_size != 0)
-                ERROR ("write_http plugin: Ignoring invalid BufferSize setting (%d).",
+                ERROR (PLUGIN_NAME " plugin: Ignoring invalid BufferSize setting (%d).",
                                 buffer_size);
 
         /* Allocate the buffer. */
         cb->send_buffer = malloc (cb->send_buffer_size);
         if (cb->send_buffer == NULL)
         {
-                ERROR ("write_http plugin: malloc(%zu) failed.", cb->send_buffer_size);
-                wh_callback_free (cb);
+                ERROR (PLUGIN_NAME " plugin: malloc(%zu) failed.", cb->send_buffer_size);
+                wdog_callback_free (cb);
                 return (-1);
         }
         /* Nulls the buffer and sets ..._free and ..._fill. */
-        wh_reset_buffer (cb);
+        wdog_reset_buffer (cb);
 
-        ssnprintf (callback_name, sizeof (callback_name), "write_http/%s",
+        ssnprintf (callback_name, sizeof (callback_name), "write_datadog/%s",
                         cb->name);
-        DEBUG ("write_http: Registering write callback '%s' with URL '%s'",
-                        callback_name, cb->location);
+        DEBUG ("write_datadog: Registering write callback '%s' with URL '%s'",
+                        callback_name, cb->endpoint);
 
         memset (&user_data, 0, sizeof (user_data));
         user_data.data = cb;
         user_data.free_func = NULL;
-        plugin_register_flush (callback_name, wh_flush, &user_data);
+        plugin_register_flush (callback_name, wdog_flush, &user_data);
 
-        user_data.free_func = wh_callback_free;
-        plugin_register_write (callback_name, wh_write, &user_data);
+        user_data.free_func = wdog_callback_free;
+        plugin_register_write (callback_name, wdog_write, &user_data);
 
         return (0);
-} /* }}} int wh_config_node */
+} /* }}} int wdog_config_node */
 
-static int wh_config (oconfig_item_t *ci) /* {{{ */
+static int wdog_config (oconfig_item_t *ci) /* {{{ */
 {
         int i;
 
@@ -691,35 +925,35 @@ static int wh_config (oconfig_item_t *ci) /* {{{ */
                 oconfig_item_t *child = ci->children + i;
 
                 if (strcasecmp ("Node", child->key) == 0)
-                        wh_config_node (child);
+                        wdog_config_node (child);
                 /* FIXME: Remove this legacy mode in version 6. */
                 else if (strcasecmp ("URL", child->key) == 0) {
-                        WARNING ("write_http plugin: Legacy <URL> block found. "
+                        WARNING (PLUGIN_NAME " plugin: Legacy <URL> block found. "
                                 "Please use <Node> instead.");
-                        wh_config_node (child);
+                        wdog_config_node (child);
                 }
                 else
                 {
-                        ERROR ("write_http plugin: Invalid configuration "
+                        ERROR (PLUGIN_NAME " plugin: Invalid configuration "
                                         "option: %s.", child->key);
                 }
         }
 
         return (0);
-} /* }}} int wh_config */
+} /* }}} int wdog_config */
 
-static int wh_init (void) /* {{{ */
+static int wdog_init (void) /* {{{ */
 {
         /* Call this while collectd is still single-threaded to avoid
          * initialization issues in libgcrypt. */
         curl_global_init (CURL_GLOBAL_SSL);
         return (0);
-} /* }}} int wh_init */
+} /* }}} int wdog_init */
 
 void module_register (void) /* {{{ */
 {
-        plugin_register_complex_config ("write_http", wh_config);
-        plugin_register_init ("write_http", wh_init);
+        plugin_register_complex_config ("write_datadog", wdog_config);
+        plugin_register_init ("write_datadog", wdog_init);
 } /* }}} void module_register */
 
 /* vim: set fdm=marker sw=8 ts=8 tw=78 et : */
