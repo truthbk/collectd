@@ -28,6 +28,7 @@
 #include "utils_format_json.h"
 
 #include "string.h"
+#include "time.h"
 
 #if HAVE_PTHREAD_H
 # include <pthread.h>
@@ -44,6 +45,11 @@
 
 #define DD_MAX_TAG_LEN 255
 
+//NOTE : linear search only viable as long as N_SUPPORTED_PLUGINS is small - this gets called a lot.
+//       otherwise either get a hash-table in here, or use BS.
+#define N_SUPPORTED_PLUGINS 1
+const char * const DD_PLUGINS_SUPPORTED[] = { "snmp" }
+
 /*
  * Private variables
  */
@@ -55,7 +61,7 @@ struct wdog_callback_s
         char     *endpoint;
         char     *api_key;
         int      n_tags;
-        char     *tags; //probably should be **
+        char     **tags;
         _Bool    element_tag;
 
         //CURL OPTS
@@ -102,7 +108,7 @@ static int dd_json_escape_string (char *buffer, size_t buffer_size, /* {{{ */
 
   dst_pos = 0;
 
-#define BUFFER_ADD(c) do { \
+#define PUT_CHAR(c) do { \
   if (dst_pos >= (buffer_size - 1)) { \
     buffer[buffer_size - 1] = 0; \
     return (-ENOMEM); \
@@ -112,247 +118,206 @@ static int dd_json_escape_string (char *buffer, size_t buffer_size, /* {{{ */
 } while (0)
 
   /* Escape special characters */
-  BUFFER_ADD ('"');
+  PUT_CHAR ('"');
   for (src_pos = 0; string[src_pos] != 0; src_pos++)
   {
     if ((string[src_pos] == '"')
         || (string[src_pos] == '\\'))
     {
-      BUFFER_ADD ('\\');
-      BUFFER_ADD (string[src_pos]);
+      PUT_CHAR ('\\');
+      PUT_CHAR (string[src_pos]);
     }
     else if (string[src_pos] <= 0x001F)
-      BUFFER_ADD ('?');
+      PUT_CHAR ('?');
     else
-      BUFFER_ADD (string[src_pos]);
+      PUT_CHAR (string[src_pos]);
   } /* for */
-  BUFFER_ADD ('"');
+  PUT_CHAR ('"');
   buffer[dst_pos] = 0;
 
-#undef BUFFER_ADD
+#undef PUT_CHAR
 
   return (0);
 } /* }}} int dd_json_escape_string */
 
-static int values_to_json (char *buffer, size_t buffer_size, /* {{{ */
-                const data_set_t *ds, const value_list_t *vl, int store_rates)
+static inline int buffer_add(char * buffer, int buffer_size, int * offset, ...) {
+  int status;
+  status = ssnprintf (buffer + *offset, buffer_size - *offset, __VA_ARGS__);
+  if (status < 1)
+    return (-1);
+  else if (((size_t) status) >= (buffer_size - *offset))
+    return (-ENOMEM);
+  else
+    *offset += ((size_t) status);
+  return (0);
+}
+
+// TODO: make sure this matches expected output.
+static int extract_ddmetric_name_to_json(char *buffer, size_t buffer_size,
+                const data_set_t *ds, const value_list_t *vl, int n)
 {
+  int stastus = 0;
   size_t offset = 0;
-  size_t i;
-  gauge_t *rates = NULL;
+  memset (buffer, 0, buffer_size);
+
+  status += buffer_add(buffer, buffer_size, &offset, "\"");
+  status += buffer_add(buffer, buffer_size, &offset, vl->plugin);
+  status += buffer_add(buffer, buffer_size, &offset, ".");
+  status += buffer_add(buffer, buffer_size, &offset, vl->type);
+  status += buffer_add(buffer, buffer_size, &offset, ".");
+  status += buffer_add(buffer, buffer_size, &offset,
+                  "%s" DS_TYPE_TO_STRING (ds->ds[n].name));
+  status += buffer_add(buffer, buffer_size, &offset, "\"");
+
+  return !!status;
+
+}
+
+static int extract_ddpoints_to_json(char *buffer, size_t buffer_size,
+                const data_set_t *ds, const value_list_t *vl, int n)
+{
+  int status = 0;
+  size_t offset = 0;
+  time_t t = CDTIME_T_TO_TIME_T(vl->time)
 
   memset (buffer, 0, buffer_size);
 
-#define BUFFER_ADD(...) do { \
-  int status; \
-  status = ssnprintf (buffer + offset, buffer_size - offset, \
-      __VA_ARGS__); \
-  if (status < 1) \
-  { \
-    sfree(rates); \
-    return (-1); \
-  } \
-  else if (((size_t) status) >= (buffer_size - offset)) \
-  { \
-    sfree(rates); \
-    return (-ENOMEM); \
-  } \
-  else \
-    offset += ((size_t) status); \
-} while (0)
+  status += buffer_add(buffer, buffer_size, &offset, "[");
+  status += buffer_add(buffer, buffer_size, &offset, "%s", ctime(&t));
+  status += buffer_add(buffer, buffer_size, &offset, ", ");
+  if (ds->ds[n].type == DS_TYPE_GAUGE)
+          status += buffer_add (buffer, buffer_size, &offset, JSON_GAUGE_FORMAT, vl->values[n].gauge);
+  else if (ds->ds[n].type == DS_TYPE_COUNTER)
+          status += buffer_add (buffer, buffer_size, &offset, "%llu", vl->values[n].counter);
+  else //what do we do with the other cases? DS_TYPE_DERIVE DS_TYPE_ABSOLUTE
+          status += buffer_add (buffer, buffer_size, &offset, "UNKNOWN");
+  status += buffer_add(buffer, buffer_size, &offset, "]");
 
-  BUFFER_ADD ("[");
-  for (i = 0; i < ds->ds_num; i++)
-  {
-    if (i > 0)
-      BUFFER_ADD (",");
+  return !!status;
+}
 
-    if (ds->ds[i].type == DS_TYPE_GAUGE)
-    {
-      if(isfinite (vl->values[i].gauge))
-        BUFFER_ADD (JSON_GAUGE_FORMAT, vl->values[i].gauge);
-      else
-        BUFFER_ADD ("null");
-    }
-    else if (store_rates)
-    {
-      if (rates == NULL)
-        rates = uc_get_rate (ds, vl);
-      if (rates == NULL)
-      {
-        WARNING ("utils_format_json: uc_get_rate failed.");
-        sfree(rates);
-        return (-1);
-      }
-
-      if(isfinite (rates[i]))
-        BUFFER_ADD (JSON_GAUGE_FORMAT, rates[i]);
-      else
-        BUFFER_ADD ("null");
-    }
-    else if (ds->ds[i].type == DS_TYPE_COUNTER)
-      BUFFER_ADD ("%llu", vl->values[i].counter);
-    else if (ds->ds[i].type == DS_TYPE_DERIVE)
-      BUFFER_ADD ("%"PRIi64, vl->values[i].derive);
-    else if (ds->ds[i].type == DS_TYPE_ABSOLUTE)
-      BUFFER_ADD ("%"PRIu64, vl->values[i].absolute);
-    else
-    {
-      ERROR ("format_json: Unknown data source type: %i",
-          ds->ds[i].type);
-      sfree (rates);
-      return (-1);
-    }
-  } /* for ds->ds_num */
-  BUFFER_ADD ("]");
-
-#undef BUFFER_ADD
-
-  DEBUG ("format_json: values_to_json: buffer = %s;", buffer);
-  sfree(rates);
-  return (0);
-} /* }}} int values_to_json */
-
-static int value_list_to_json (char *buffer, size_t buffer_size, /* {{{ */
-                const data_set_t *ds, const value_list_t *vl, int store_rates)
+static int extract_ddtags_to_json(char *buffer, size_t buffer_size,
+                const data_set_t *ds, const value_list_t *vl,
+                const char * const * tags, int n_tags, _Bool device_tag)
 {
-  char temp[512];
+  int i, status = 0;
   size_t offset = 0;
-  int status;
+  memset (buffer, 0, buffer_size);
+
+  status += buffer_add(buffer, buffer_size, &offset, "[");
+  for(i=0 ; i<n_tags ; i++) {
+          status += buffer_add (buffer, buffer_size, &offset, tags[i]);
+          if (i != n_tags) {
+                  status += buffer_add (buffer, buffer_size, &offset, ", ");
+          }
+  }
+  if (device_tag) {
+      status += buffer_add(buffer, buffer_size, &offset, "snmp_device:%s",vl->plugin_instance);
+      // buffer_add("snmp_device:%s",vl->host);
+  }
+  status += buffer_add(buffer, buffer_size, &offset, "]");
+
+  return !!status;
+}
+
+static int gen_dd_payload_js (char *buffer, size_t buffer_size, /* {{{ */
+                const data_set_t *ds, const value_list_t *vl,
+                const char * const * tags, int n_tags, _Bool device_tag)
+{
+  char temp[1024];
+  size_t offset = 0;
+  int i, status = 0;
 
   memset (buffer, 0, buffer_size);
 
-#define BUFFER_ADD(...) do { \
-  status = ssnprintf (buffer + offset, buffer_size - offset, \
-      __VA_ARGS__); \
-  if (status < 1) \
-    return (-1); \
-  else if (((size_t) status) >= (buffer_size - offset)) \
-    return (-ENOMEM); \
-  else \
-    offset += ((size_t) status); \
-} while (0)
-
-  /* All value lists have a leading comma. The first one will be replaced with
-   * a square bracket in `format_dd_json_finalize'. */
-  BUFFER_ADD (",{");
-
-  status = extract_ddmetric_to_json (temp, sizeof (temp), ds);
-  if (status != 0)
-    return (status);
-  BUFFER_ADD ("\"metric\":%s", temp);
-
-  status = extract_ddpoints_to_json (temp, sizeof (temp), ds, vl, store_rates);
-  if (status != 0)
-    return (status);
-  BUFFER_ADD ("\"points\":%s", temp);
-
-  status = extract_ddtypes_to_json (temp, sizeof (temp), ds);
-  if (status != 0)
-    return (status);
-  BUFFER_ADD ("\"type\":%s", temp);
-
-  BUFFER_ADD_KEYVAL ("host", vl->host);
-
-  status = extract_ddtags_to_json (temp, sizeof (temp), ds);
-  if (status != 0)
-    return (status);
-  BUFFER_ADD ("\"tags\":%s", temp);
-
-
-#if 0
-  status = values_to_json (temp, sizeof (temp), ds, vl, store_rates);
-  if (status != 0)
-    return (status);
-  BUFFER_ADD ("\"values\":%s", temp);
-
-  status = dstypes_to_json (temp, sizeof (temp), ds);
-  if (status != 0)
-    return (status);
-  BUFFER_ADD (",\"dstypes\":%s", temp);
-
-  status = dsnames_to_json (temp, sizeof (temp), ds);
-  if (status != 0)
-    return (status);
-  BUFFER_ADD (",\"dsnames\":%s", temp);
-
-  BUFFER_ADD (",\"time\":%.3f", CDTIME_T_TO_DOUBLE (vl->time));
-  BUFFER_ADD (",\"interval\":%.3f", CDTIME_T_TO_DOUBLE (vl->interval));
-
-#define BUFFER_ADD_KEYVAL(key, value) do { \
-  status = dd_json_escape_string (temp, sizeof (temp), (value)); \
-  if (status != 0) \
-    return (status); \
-  BUFFER_ADD (",\"%s\":%s", (key), temp); \
-} while (0)
-
-  BUFFER_ADD_KEYVAL ("host", vl->host);
-  BUFFER_ADD_KEYVAL ("plugin", vl->plugin);
-  BUFFER_ADD_KEYVAL ("plugin_instance", vl->plugin_instance);
-  BUFFER_ADD_KEYVAL ("type", vl->type);
-  BUFFER_ADD_KEYVAL ("type_instance", vl->type_instance);
-#endif
-
-#if 0
-  if (vl->meta != NULL)
+  for(i=0 ; i<vl->values_len ; i++)
   {
-    char meta_buffer[buffer_size];
-    memset (meta_buffer, 0, sizeof (meta_buffer));
-    status = meta_data_to_json (meta_buffer, sizeof (meta_buffer), vl->meta);
-    if (status != 0)
-      return (status);
+        /* All value lists have a leading comma. The first one will be replaced with
+         * a square bracket in `format_dd_json_finalize'. */
+        status += buffer_add (buffer, buffer_size, &offset, ",{");
+        if (status)
+                return (status);
 
-    BUFFER_ADD (",\"meta\":%s", meta_buffer);
-  } /* if (vl->meta != NULL) */
-#endif
+        status = extract_ddmetric_name_to_json (temp, sizeof (temp), ds, vl, i);
+        if (status)
+                return (status);
 
-  BUFFER_ADD ("}");
+        status += buffer_add (buffer, buffer_size, &offset, "\"metric\":%s", temp);
+        status += buffer_add(buffer, buffer_size, &offset, "[", temp)
+        if (status)
+                return (status);
 
-#undef BUFFER_ADD_KEYVAL
-#undef BUFFER_ADD
+        status = extract_ddpoints_to_json (temp, sizeof (temp), ds, vl, i);
+        if (status)
+                return (status);
 
-  DEBUG ("format_json: value_list_to_json: buffer = %s;", buffer);
+        status += buffer_add (buffer, buffer_size, &offset, "],\"points\":%s", temp);
+        status += buffer_add (buffer, buffer_size, &offset, ",\"type\":\"gauge\"");
+
+        // WATCH OUT: this might not be consistent
+        status += buffer_add (buffer, buffer_size, &offset, "host", vl->host);
+        if (status)
+                return (status);
+
+        status = generate_ddtags_to_json (temp, sizeof (temp), ds);
+        if (status)
+                return (status);
+
+        status += buffer_add (buffer, buffer_size, &offset, "\"tags\":%s", temp);
+        if (status)
+                return (status);
+
+        status = extract_ddtags_to_json (temp, sizeof (temp), ds, vl,
+                        tags, n_tags, device_tag);
+        if (status)
+                return (status);
+
+        status += buffer_add (buffer, buffer_size, &offset, "\"tags\":%s", temp);
+        status += buffer_add (buffer, buffer_size, &offset, "}");
+        if (status)
+                return (status);
+  }
+
+  DEBUG ("format_json: gen_dd_payload_js: buffer = %s;", buffer);
 
   return (0);
-} /* }}} int value_list_to_json */
+} /* }}} int gen_dd_payload_js */
 
-static int format_dd_json_value_list_nocheck (char *buffer, /* {{{ */
-    size_t *ret_buffer_fill, size_t *ret_buffer_free,
-    const data_set_t *ds, const value_list_t *vl,
-    int store_rates, size_t temp_size)
+static int generate_dd_json(
+    wdog_callback_t *cb,
+    const data_set_t *ds, const value_list_t *vl)
 {
-  char temp[temp_size];
+  char * temp;
   int status;
 
-  status = value_list_to_json (temp, sizeof (temp), ds, vl, store_rates);
+  if ((cb == NULL) || (cb->send_buffer == NULL)
+      || (cb->send_buffer_fill == NULL) || (cb->send_buffer_free == NULL)
+      || (ds == NULL) || (vl == NULL)) {
+    return (-EINVAL);
+  }
+
+  if (*(cb->send_buffer_free) < 3) {
+    return (-ENOMEM);
+  }
+
+  // Get rid of this malloc
+  if (!(temp = malloc(cb->send_buffer_free - 2))) {
+    return (-ENOMEM);
+  }
+
+  status = gen_dd_payload_js (temp, sizeof (temp), ds, vl,
+                  cb->tags, cb->n_tags, cb->element_tag);
   if (status != 0)
     return (status);
   temp_size = strlen (temp);
 
-  memcpy (buffer + (*ret_buffer_fill), temp, temp_size + 1);
-  (*ret_buffer_fill) += temp_size;
-  (*ret_buffer_free) -= temp_size;
+  memcpy (cb->send_buffer + (*cb->send_buffer_fill), temp, temp_size + 1);
+  (*cb->send_buffer_fill) += temp_size;
+  (*cb->send_buffer_free) -= temp_size;
+  sfree (temp);
 
   return (0);
-} /* }}} int format_dd_json_value_list_nocheck */
-
-int format_dd_json_value_list (char *buffer, /* {{{ */
-    size_t *ret_buffer_fill, size_t *ret_buffer_free,
-    const data_set_t *ds, const value_list_t *vl, int store_rates)
-{
-  if ((buffer == NULL)
-      || (ret_buffer_fill == NULL) || (ret_buffer_free == NULL)
-      || (ds == NULL) || (vl == NULL))
-    return (-EINVAL);
-
-  if (*ret_buffer_free < 3)
-    return (-ENOMEM);
-
-  return (format_dd_json_value_list_nocheck (buffer,
-        ret_buffer_fill, ret_buffer_free, ds, vl,
-        store_rates, (*ret_buffer_free) - 2));
-} /* }}} int format_dd_json_value_list */
-
+} /* }}} int generate_dd_json_nocheck */
 
 
 static void wdog_log_http_error (wdog_callback_t *cb)
@@ -439,32 +404,7 @@ static int wdog_callback_init (wdog_callback_t *cb) /* {{{ */
         curl_easy_setopt (cb->curl, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt (cb->curl, CURLOPT_MAXREDIRS, 50L);
 
-        if (cb->user != NULL)
-        {
-#ifdef HAVE_CURLOPT_USERNAME
-                curl_easy_setopt (cb->curl, CURLOPT_USERNAME, cb->user);
-                curl_easy_setopt (cb->curl, CURLOPT_PASSWORD,
-                        (cb->pass == NULL) ? "" : cb->pass);
-#else
-                size_t credentials_size;
-
-                credentials_size = strlen (cb->user) + 2;
-                if (cb->pass != NULL)
-                        credentials_size += strlen (cb->pass);
-
-                cb->credentials = (char *) malloc (credentials_size);
-                if (cb->credentials == NULL)
-                {
-                        ERROR ("curl plugin: malloc failed.");
-                        return (-1);
-                }
-
-                ssnprintf (cb->credentials, credentials_size, "%s:%s",
-                                cb->user, (cb->pass == NULL) ? "" : cb->pass);
-                curl_easy_setopt (cb->curl, CURLOPT_USERPWD, cb->credentials);
-#endif
-                curl_easy_setopt (cb->curl, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
-        }
+        //TODO: add api-key to request
 
         curl_easy_setopt (cb->curl, CURLOPT_SSL_VERIFYPEER, (long) cb->verify_peer);
         curl_easy_setopt (cb->curl, CURLOPT_SSL_VERIFYHOST,
@@ -580,110 +520,29 @@ static void wdog_callback_free (void *data) /* {{{ */
         }
         sfree (cb->name);
         sfree (cb->endpoint);
-        sfree (cb->user);
-        sfree (cb->pass);
-        sfree (cb->credentials);
+        sfree (cb->api_key);
         sfree (cb->cacert);
         sfree (cb->capath);
         sfree (cb->clientkey);
         sfree (cb->clientcert);
         sfree (cb->clientkeypass);
         sfree (cb->send_buffer);
+        for(i=0 ; i<cb->n_tags ; i++) {
+                sfree (cb->tags[i]);
+        }
+        if(cb->tags)
+                sfree (cb->tags);
 
         sfree (cb);
 } /* }}} void wdog_callback_free */
 
-static int wdog_write_command (const data_set_t *ds, const value_list_t *vl, /* {{{ */
-                wdog_callback_t *cb)
-{
-        char key[10*DATA_MAX_NAME_LEN];
-        char values[512];
-        char command[1024];
-        size_t command_len;
-
-        int status;
-
-        if (0 != strcmp (ds->type, vl->type)) {
-                ERROR (PLUGIN_NAME " plugin: DS type does not match "
-                                "value list type");
-                return -1;
-        }
-
-        /* Copy the identifier to `key' and escape it. */
-        status = FORMAT_VL (key, sizeof (key), vl);
-        if (status != 0) {
-                ERROR (PLUGIN_NAME " plugin: error with format_name");
-                return (status);
-        }
-        escape_string (key, sizeof (key));
-
-        /* Convert the values to an ASCII representation and put that into
-         * `values'. */
-        status = format_values (values, sizeof (values), ds, vl, cb->store_rates);
-        if (status != 0) {
-                ERROR (PLUGIN_NAME " plugin: error with "
-                                "wdog_value_list_to_string");
-                return (status);
-        }
-
-        command_len = (size_t) ssnprintf (command, sizeof (command),
-                        "PUTVAL %s interval=%.3f %s\r\n",
-                        key,
-                        CDTIME_T_TO_DOUBLE (vl->interval),
-                        values);
-        if (command_len >= sizeof (command)) {
-                ERROR (PLUGIN_NAME " plugin: Command buffer too small: "
-                                "Need %zu bytes.", command_len + 1);
-                return (-1);
-        }
-
-        pthread_mutex_lock (&cb->send_lock);
-
-        if (cb->curl == NULL)
-        {
-                status = wdog_callback_init (cb);
-                if (status != 0)
-                {
-                        ERROR (PLUGIN_NAME " plugin: wdog_callback_init failed.");
-                        pthread_mutex_unlock (&cb->send_lock);
-                        return (-1);
-                }
-        }
-
-        if (command_len >= cb->send_buffer_free)
-        {
-                status = wdog_flush_nolock (/* timeout = */ 0, cb);
-                if (status != 0)
-                {
-                        pthread_mutex_unlock (&cb->send_lock);
-                        return (status);
-                }
-        }
-        assert (command_len < cb->send_buffer_free);
-
-        /* `command_len + 1' because `command_len' does not include the
-         * trailing null byte. Neither does `send_buffer_fill'. */
-        memcpy (cb->send_buffer + cb->send_buffer_fill,
-                        command, command_len + 1);
-        cb->send_buffer_fill += command_len;
-        cb->send_buffer_free -= command_len;
-
-        DEBUG (PLUGIN_NAME " plugin: <%s> buffer %zu/%zu (%g%%) \"%s\"",
-                        cb->endpoint,
-                        cb->send_buffer_fill, cb->send_buffer_size,
-                        100.0 * ((double) cb->send_buffer_fill) / ((double) cb->send_buffer_size),
-                        command);
-
-        /* Check if we have enough space for this command. */
-        pthread_mutex_unlock (&cb->send_lock);
-
-        return (0);
-} /* }}} int wdog_write_command */
 
 static int wdog_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{ */
                 wdog_callback_t *cb)
 {
-        int status;
+        int i, status;
+        char * tags = NULL;
+        _Bool plugin_available = 0;
 
         pthread_mutex_lock (&cb->send_lock);
 
@@ -698,10 +557,18 @@ static int wdog_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{
                 }
         }
 
-        status = format_dd_json_value_list (cb->send_buffer,
-                        &cb->send_buffer_fill,
-                        &cb->send_buffer_free,
-                        ds, vl, cb->store_rates);
+        for (i=0 ; i<N_SUPPORTED_PLUGINS ; i++) {
+                if(strcasecmp(vl->plugin, DD_SUPPORTED_PLUGINS[i]) == 0) {
+                        plugin_available = 1;
+                        break;
+                }
+        }
+
+        if(!plugin_available) {
+                return (0); //do we have a better status?
+        }
+
+        status = generate_dd_json (cb, ds, vl);
         if (status == (-ENOMEM))
         {
                 status = wdog_flush_nolock (/* timeout = */ 0, cb);
@@ -712,10 +579,7 @@ static int wdog_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{
                         return (status);
                 }
 
-                status = format_dd_json_value_list (cb->send_buffer,
-                                &cb->send_buffer_fill,
-                                &cb->send_buffer_free,
-                                ds, vl, cb->store_rates);
+                status = generate_dd_json (cb, ds, vl);
         }
         if (status != 0)
         {
