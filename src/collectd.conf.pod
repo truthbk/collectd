@@ -7583,6 +7583,116 @@ traffic between collectd and the HTTP server.
 
 =back
 
+=head2 Plugin C<write_datadog>
+
+This output plugin submits values to Datadog via the API using POST requests and
+encoding metrics in JSON as described in their documentation:
+L<http://docs.datadoghq.com/api/>. Currently this plugin will only submit SNMP
+metrics.
+
+Synopsis:
+
+ <Plugin "write_datadog">
+   <Node "example">
+     Api-Key "somedatadogapikey"
+   </Node>
+ </Plugin>
+
+The plugin can send values for multiple Datadog accounts, should you have them, use a
+E<lt>B<Node>E<nbsp>I<Name>E<gt> block for each API key. Within each B<Node>
+block, the following options are available:
+
+=over 4
+
+=item B<Api-Key> I<String>
+
+Mandatory API-Key required for authentication.
+
+=item B<Tags> I<String>
+
+Optional set of tags you'd like to apply to the values sent to Datadog.
+
+=item B<VerifyPeer> B<true>|B<false>
+
+Enable or disable peer SSL certificate verification. See
+L<http://curl.haxx.se/docs/sslcerts.html> for details. Enabled by default.
+
+=item B<VerifyHost> B<true|false>
+
+Enable or disable peer host name verification. If enabled, the plugin checks if
+the C<Common Name> or a C<Subject Alternate Name> field of the SSL certificate
+matches the host name provided by the B<URL> option. If this identity check
+fails, the connection is aborted. Obviously, only works when connecting to a
+SSL enabled server. Enabled by default.
+
+=item B<CACert> I<File>
+
+File that holds one or more SSL certificates. If you want to use HTTPS you will
+possibly need this option. What CA certificates come bundled with C<libcurl>
+and are checked by default depends on the distribution you use.
+
+=item B<CAPath> I<Directory>
+
+Directory holding one or more CA certificate files. You can use this if for
+some reason all the needed CA certificates aren't in the same file and can't be
+pointed to using the B<CACert> option. Requires C<libcurl> to be built against
+OpenSSL.
+
+=item B<ClientKey> I<File>
+
+File that holds the private key in PEM format to be used for certificate-based
+authentication.
+
+=item B<ClientCert> I<File>
+
+File that holds the SSL certificate to be used for certificate-based
+authentication.
+
+=item B<ClientKeyPass> I<Password>
+
+Password required to load the private key in B<ClientKey>.
+
+=item B<SSLVersion> B<SSLv2>|B<SSLv3>|B<TLSv1>|B<TLSv1_0>|B<TLSv1_1>|B<TLSv1_2>
+
+Define which SSL protocol version must be used. By default C<libcurl> will
+attempt to figure out the remote SSL protocol version. See
+L<curl_easy_setopt(3)> for more details.
+
+=item B<BufferSize> I<Bytes>
+
+Sets the send buffer size to I<Bytes>. By increasing this buffer, less HTTP
+requests will be generated, but more metrics will be batched / metrics are
+cached for longer before being sent, introducing additional delay until they
+are available on the server side. I<Bytes> must be at least 1024 and cannot
+exceed the size of an C<int>, i.e. 2E<nbsp>GByte.
+Defaults to C<4096>.
+
+=item B<LowSpeedLimit> I<Bytes per Second>
+
+Sets the minimal transfer rate in I<Bytes per Second> below which the
+connection with the HTTP server will be considered too slow and aborted. All
+the data submitted over this connection will probably be lost. Defaults to 0,
+which means no minimum transfer rate is enforced.
+
+=item B<Timeout> I<Timeout>
+
+Sets the maximum time in milliseconds given for HTTP POST operations to
+complete. When this limit is reached, the POST operation will be aborted, and
+all the data in the current send buffer will probably be lost. Defaults to 0,
+which means the connection never times out.
+
+=item B<LogHttpError> B<false>|B<true>
+
+Enables printing of HTTP error code to log. Turned off by default.
+
+The C<write_datadog> plugin regularly submits the collected values to the Datadog
+API endpoint. How frequently this happens depends on how much data you are
+collecting and the size of B<BufferSize>. The optimal value to set B<Timeout>
+to is slightly below this interval, which you can estimate by monitoring the
+network traffic between collectd and the HTTP server.
+
+=back
+
 =head2 Plugin C<write_kafka>
 
 The I<write_kafka plugin> will send values to a I<Kafka> topic, a distributed

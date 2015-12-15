@@ -174,6 +174,7 @@
 %define with_wireless 0%{!?_without_wireless:1}
 %define with_write_graphite 0%{!?_without_write_graphite:1}
 %define with_write_http 0%{!?_without_write_http:1}
+%define with_write_datadog 0%{!?_without_write_datadog:1}
 %define with_write_log 0%{!?_without_write_log:1}
 %define with_write_redis 0%{!?_without_write_redis:0%{?_has_hiredis}}
 %define with_write_riemann 0%{!?_without_write_riemann:1}
@@ -757,6 +758,17 @@ Requires:	%{name}%{?_isa} = %{version}-%{release}
 BuildRequires:	curl-devel
 %description write_http
 The Write-HTTP plugin sends the values collected by collectd to a web-server
+using HTTP POST requests.
+%endif
+
+%if %{with_write_datadog}
+%package write_datadog
+Summary:	Write-Datadog plugin for collectd
+Group:		System Environment/Daemons
+Requires:	%{name}%{?_isa} = %{version}-%{release}
+BuildRequires:	curl-devel
+%description write_datadog
+The Write-Datadog plugin sends the values collected by collectd to the Datadog API
 using HTTP POST requests.
 %endif
 
@@ -1544,6 +1556,12 @@ Collectd utilities
 %define _with_write_http --disable-write_http
 %endif
 
+%if %{with_write_datadog}
+%define _with_write_datadog --enable-write_datadog
+%else
+%define _with_write_datadog --disable-write_datadog
+%endif
+
 %if %{with_write_kafka}
 %define _with_write_kafka --enable-write_kafka
 %else
@@ -1701,6 +1719,7 @@ Collectd utilities
 	%{?_with_tokyotyrant} \
 	%{?_with_varnish} \
 	%{?_with_write_http} \
+	%{?_with_write_datadog} \
 	%{?_with_write_kafka} \
 	%{?_with_write_mongodb} \
 	%{?_with_write_redis} \
@@ -1748,6 +1767,7 @@ Collectd utilities
 	%{?_with_wireless}\
 	%{?_with_write_graphite} \
 	%{?_with_write_http} \
+	%{?_with_write_datadog} \
 	%{?_with_write_log} \
 	%{?_with_write_riemann} \
 	%{?_with_write_sensu} \
@@ -2350,6 +2370,11 @@ fi
 %if %{with_write_http}
 %files write_http
 %{_libdir}/%{name}/write_http.so
+%endif
+
+%if %{with_write_datadog}
+%files write_datadog
+%{_libdir}/%{name}/write_datadog.so
 %endif
 
 %if %{with_write_kafka}

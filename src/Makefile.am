@@ -1224,6 +1224,19 @@ write_http_la_LIBADD += $(BUILD_WITH_LIBCURL_LIBS)
 endif
 endif
 
+if BUILD_PLUGIN_WRITE_DATADOG
+pkglib_LTLIBRARIES += write_datadog.la
+write_datadog_la_SOURCES = write_datadog.c \
+			utils_format_json.c utils_format_json.h
+write_datadog_la_LDFLAGS = $(PLUGIN_LDFLAGS)
+write_datadog_la_CFLAGS = $(AM_CFLAGS)
+write_datadog_la_LIBADD =
+if BUILD_WITH_LIBCURL
+write_datadog_la_CFLAGS += $(BUILD_WITH_LIBCURL_CFLAGS)
+write_datadog_la_LIBADD += $(BUILD_WITH_LIBCURL_LIBS)
+endif
+endif
+
 if BUILD_PLUGIN_WRITE_KAFKA
 pkglib_LTLIBRARIES += write_kafka.la
 write_kafka_la_SOURCES = write_kafka.c \

@@ -199,6 +199,7 @@
 #@BUILD_PLUGIN_WIRELESS_TRUE@LoadPlugin wireless
 #@BUILD_PLUGIN_WRITE_GRAPHITE_TRUE@LoadPlugin write_graphite
 #@BUILD_PLUGIN_WRITE_HTTP_TRUE@LoadPlugin write_http
+#@BUILD_PLUGIN_WRITE_DATADOG_TRUE@LoadPlugin write_datadog
 #@BUILD_PLUGIN_WRITE_KAFKA_TRUE@LoadPlugin write_kafka
 #@BUILD_PLUGIN_WRITE_LOG_TRUE@LoadPlugin write_log
 #@BUILD_PLUGIN_WRITE_MONGODB_TRUE@LoadPlugin write_mongodb
@@ -1374,6 +1375,26 @@
 #		SSLVersion "TLSv1"
 #		Format "Command"
 #		StoreRates false
+#		BufferSize 4096
+#		LowSpeedLimit 0
+#		Timeout 0
+#	</Node>
+#</Plugin>
+
+#<Plugin write_datadog>
+#	<Node "example">
+#		Endpoint "http://example.com/collectd-post"
+#		Api-Key "somelongapikey"
+#		Tags "Comma,Separated,Tag,List"
+#		Element-Tag true
+#		VerifyPeer true
+#		VerifyHost true
+#		CACert "/etc/ssl/ca.crt"
+#		CAPath "/etc/ssl/certs/"
+#		ClientKey "/etc/ssl/client.pem"
+#		ClientCert "/etc/ssl/client.crt"
+#		ClientKeyPass "secret"
+#		SSLVersion "TLSv1"
 #		BufferSize 4096
 #		LowSpeedLimit 0
 #		Timeout 0
