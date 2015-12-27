@@ -31,7 +31,7 @@
 #include "time.h"
 
 #if HAVE_PTHREAD_H
-# include <pthread.h>
+#include <pthread.h>
 #endif
 
 #include <curl/curl.h>
@@ -39,6 +39,9 @@
 #ifndef WRITE_DATADOG_DEFAULT_BUFFER_SIZE
 # define WRITE_DATADOG_DEFAULT_BUFFER_SIZE 4096
 #endif
+
+#include <stddef.h>
+#include <stdarg.h>
 
 #define PLUGIN_NAME "write_datadog"
 #define DD_BASE_URL "https://app.datadoghq.com/api/v1"
@@ -48,7 +51,7 @@
 //NOTE : linear search only viable as long as N_SUPPORTED_PLUGINS is small - this gets called a lot.
 //       otherwise either get a hash-table in here, or use BS.
 #define N_SUPPORTED_PLUGINS 1
-const char * const DD_PLUGINS_SUPPORTED[] = { "snmp" }
+const char * const DD_SUPPORTED_PLUGINS[] = { "snmp" };
 
 /*
  * Private variables
@@ -92,8 +95,19 @@ struct wdog_callback_s
 };
 typedef struct wdog_callback_s wdog_callback_t;
 
+int svsnprintf (char *dest, size_t n, const char *format, va_list args)
+{
+	int ret = 0;
+
+	ret = vsnprintf (dest, n, format, args);
+	dest[n - 1] = '\0';
+
+	return (ret);
+} /* int svsnprintf */
+
 
 //JSON Stuff
+#if 0
 static int dd_json_escape_string (char *buffer, size_t buffer_size, /* {{{ */
     const char *string)
 {
@@ -139,16 +153,22 @@ static int dd_json_escape_string (char *buffer, size_t buffer_size, /* {{{ */
 
   return (0);
 } /* }}} int dd_json_escape_string */
+#endif
 
-static inline int buffer_add(char * buffer, int buffer_size, int * offset, ...) {
+static inline int buffer_add(char * buffer, int buffer_size, size_t * offset, const char * format, ...) {
   int status;
-  status = ssnprintf (buffer + *offset, buffer_size - *offset, __VA_ARGS__);
+  va_list args;
+
+  va_start(args, format);
+  status = svsnprintf (buffer + *offset, buffer_size - *offset, format, args);
   if (status < 1)
     return (-1);
   else if (((size_t) status) >= (buffer_size - *offset))
     return (-ENOMEM);
   else
     *offset += ((size_t) status);
+
+  va_end(args);
   return (0);
 }
 
@@ -156,7 +176,7 @@ static inline int buffer_add(char * buffer, int buffer_size, int * offset, ...) 
 static int extract_ddmetric_name_to_json(char *buffer, size_t buffer_size,
                 const data_set_t *ds, const value_list_t *vl, int n)
 {
-  int stastus = 0;
+  int status = 0;
   size_t offset = 0;
   memset (buffer, 0, buffer_size);
 
@@ -166,7 +186,7 @@ static int extract_ddmetric_name_to_json(char *buffer, size_t buffer_size,
   status += buffer_add(buffer, buffer_size, &offset, vl->type);
   status += buffer_add(buffer, buffer_size, &offset, ".");
   status += buffer_add(buffer, buffer_size, &offset,
-                  "%s" DS_TYPE_TO_STRING (ds->ds[n].name));
+                  "%s", ds->ds[n].name);
   status += buffer_add(buffer, buffer_size, &offset, "\"");
 
   return !!status;
@@ -178,7 +198,7 @@ static int extract_ddpoints_to_json(char *buffer, size_t buffer_size,
 {
   int status = 0;
   size_t offset = 0;
-  time_t t = CDTIME_T_TO_TIME_T(vl->time)
+  time_t t = CDTIME_T_TO_TIME_T(vl->time);
 
   memset (buffer, 0, buffer_size);
 
@@ -243,7 +263,7 @@ static int gen_dd_payload_js (char *buffer, size_t buffer_size, /* {{{ */
                 return (status);
 
         status += buffer_add (buffer, buffer_size, &offset, "\"metric\":%s", temp);
-        status += buffer_add(buffer, buffer_size, &offset, "[", temp)
+        status += buffer_add(buffer, buffer_size, &offset, "[", temp);
         if (status)
                 return (status);
 
@@ -256,14 +276,6 @@ static int gen_dd_payload_js (char *buffer, size_t buffer_size, /* {{{ */
 
         // WATCH OUT: this might not be consistent
         status += buffer_add (buffer, buffer_size, &offset, "host", vl->host);
-        if (status)
-                return (status);
-
-        status = generate_ddtags_to_json (temp, sizeof (temp), ds);
-        if (status)
-                return (status);
-
-        status += buffer_add (buffer, buffer_size, &offset, "\"tags\":%s", temp);
         if (status)
                 return (status);
 
@@ -291,12 +303,11 @@ static int generate_dd_json(
   int status;
 
   if ((cb == NULL) || (cb->send_buffer == NULL)
-      || (cb->send_buffer_fill == NULL) || (cb->send_buffer_free == NULL)
       || (ds == NULL) || (vl == NULL)) {
     return (-EINVAL);
   }
 
-  if (*(cb->send_buffer_free) < 3) {
+  if (cb->send_buffer_free < 3) {
     return (-ENOMEM);
   }
 
@@ -306,14 +317,14 @@ static int generate_dd_json(
   }
 
   status = gen_dd_payload_js (temp, sizeof (temp), ds, vl,
-                  cb->tags, cb->n_tags, cb->element_tag);
+                  (const char * const*)cb->tags, cb->n_tags, cb->element_tag);
   if (status != 0)
     return (status);
-  temp_size = strlen (temp);
+  size_t temp_size = strlen (temp);
 
-  memcpy (cb->send_buffer + (*cb->send_buffer_fill), temp, temp_size + 1);
-  (*cb->send_buffer_fill) += temp_size;
-  (*cb->send_buffer_free) -= temp_size;
+  memcpy (cb->send_buffer + (cb->send_buffer_fill), temp, temp_size + 1);
+  (cb->send_buffer_fill) += temp_size;
+  (cb->send_buffer_free) -= temp_size;
   sfree (temp);
 
   return (0);
@@ -504,6 +515,7 @@ static int wdog_flush (cdtime_t timeout, /* {{{ */
 
 static void wdog_callback_free (void *data) /* {{{ */
 {
+        int i;
         wdog_callback_t *cb;
 
         if (data == NULL)
@@ -541,7 +553,6 @@ static int wdog_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{
                 wdog_callback_t *cb)
 {
         int i, status;
-        char * tags = NULL;
         _Bool plugin_available = 0;
 
         pthread_mutex_lock (&cb->send_lock);
@@ -613,7 +624,6 @@ static int wdog_write (const data_set_t *ds, const value_list_t *vl, /* {{{ */
         return (status);
 } /* }}} int wdog_write */
 
-
 static int config_set_tags (wdog_callback_t *cb, char *tag_str)
 {
         char *tags = NULL, *tok = NULL;
@@ -625,7 +635,7 @@ static int config_set_tags (wdog_callback_t *cb, char *tag_str)
                 n++;
         }
         cb->n_tags = n;
-        free(tags);
+        sfree(tags);
 
         if (!(cb->tags = malloc(n*sizeof(char *)))) {
                 cb->tags = NULL;
@@ -636,9 +646,9 @@ static int config_set_tags (wdog_callback_t *cb, char *tag_str)
         n = 0;
         while((tok = strsep(&tags,", "))) {
                 cb->tags[n++] = strdup(tok);
-                return -1
+                return -1;
         }
-        free(tags);
+        sfree(tags);
 
         return 0;
 }
@@ -649,7 +659,7 @@ static int wdog_config_node (oconfig_item_t *ci) /* {{{ */
         int buffer_size = 0;
         user_data_t user_data;
         char callback_name[DATA_MAX_NAME_LEN];
-        char tag_buff[DD_MAX_TAG_LEN];
+        char * tag_buff = NULL;
         int i;
 
         cb = malloc (sizeof (*cb));
@@ -659,7 +669,7 @@ static int wdog_config_node (oconfig_item_t *ci) /* {{{ */
                 return (-1);
         }
         memset (cb, 0, sizeof (*cb));
-        cb->tag_element = 1;
+        cb->element_tag = 1;
 
         cb->verify_peer = 1;
         cb->verify_host = 1;
@@ -672,7 +682,7 @@ static int wdog_config_node (oconfig_item_t *ci) /* {{{ */
         pthread_mutex_init (&cb->send_lock, /* attr = */ NULL);
 
         cf_util_get_string (ci, &cb->name);
-        cf_util_get_string (DD_BASE_URL, &cb->endpoint);
+        strncpy(cb->endpoint, DD_BASE_URL, strlen(DD_BASE_URL));
 
         for (i = 0; i < ci->children_num; i++)
         {
@@ -776,6 +786,9 @@ static int wdog_config_node (oconfig_item_t *ci) /* {{{ */
 
         user_data.free_func = wdog_callback_free;
         plugin_register_write (callback_name, wdog_write, &user_data);
+
+        // free up resources
+        sfree(tag_buff);
 
         return (0);
 } /* }}} int wdog_config_node */
