@@ -36,6 +36,8 @@
 
 #include <curl/curl.h>
 
+#include <glib.h> //hashtable
+
 #ifndef WRITE_DATADOG_DEFAULT_BUFFER_SIZE
 # define WRITE_DATADOG_DEFAULT_BUFFER_SIZE 4096
 #endif
@@ -46,12 +48,20 @@
 #define PLUGIN_NAME "write_datadog"
 #define DD_BASE_URL "https://app.datadoghq.com/api/v1"
 
+#define DD_DOGSTATSD_DEFAULT "localhost"
+#define DD_DOGSTATSD_PORT_DEFAULT 8125
+
 #define DD_MAX_TAG_LEN 255
 
-//NOTE : linear search only viable as long as N_SUPPORTED_PLUGINS is small - this gets called a lot.
-//       otherwise either get a hash-table in here, or use BS.
-#define N_SUPPORTED_PLUGINS 1
-const char * const DD_SUPPORTED_PLUGINS[] = { "snmp" };
+
+typedef int (*custom_fn) (char, size_t, const data_set_t *, const value_list_t *, 
+                const char * const *, int, _Bool)
+struct dd_handler {
+        const char * name;
+        custom_fn handler_fn;
+};
+
+GHashTable * dd_custom_fn_map;
 
 /*
  * Private variables
@@ -63,9 +73,11 @@ struct wdog_callback_s
         //DD specific
         char     *endpoint;
         char     *api_key;
+        int      dogstatsd_port;
         int      n_tags;
         char     **tags;
         _Bool    element_tag;
+        _Bool    use_dogstatsd;
 
         //CURL OPTS
         _Bool    verify_peer;
@@ -279,8 +291,14 @@ static int gen_dd_payload_js (char *buffer, size_t buffer_size, /* {{{ */
         if (status)
                 return (status);
 
-        status = extract_ddtags_to_json (temp, sizeof (temp), ds, vl,
+        custom_fn dd_fn = (custom_fn) g_hash_table_lookup(dd_custom_fn_map, vl->plugin);
+        if (dd_fn) {
+                status = (*dd_fn)(temp, sizeof (temp), ds, vl,
                         tags, n_tags, device_tag);
+        } else {
+                status = extract_ddtags_to_json (temp, sizeof (temp), ds, vl,
+                                tags, n_tags, device_tag);
+        }
         if (status)
                 return (status);
 
@@ -553,7 +571,7 @@ static int wdog_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{
                 wdog_callback_t *cb)
 {
         int i, status;
-        _Bool plugin_available = 0;
+        _Bool special_plugin_avail = 0;
 
         pthread_mutex_lock (&cb->send_lock);
 
@@ -568,14 +586,14 @@ static int wdog_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{
                 }
         }
 
-        for (i=0 ; i<N_SUPPORTED_PLUGINS ; i++) {
+        for (i=0 ; i<N_ENHANCED_PLUGINS ; i++) {
                 if(strcasecmp(vl->plugin, DD_SUPPORTED_PLUGINS[i]) == 0) {
-                        plugin_available = 1;
+                        special_plugin_avail = 1;
                         break;
                 }
         }
 
-        if(!plugin_available) {
+        if(!special_plugin_avail) {
                 return (0); //do we have a better status?
         }
 
@@ -675,6 +693,7 @@ static int wdog_config_node (oconfig_item_t *ci) /* {{{ */
         cb->verify_host = 1;
         cb->sslversion = CURL_SSLVERSION_DEFAULT;
         cb->low_speed_limit = 0;
+        cb->dogstatsd_port = DD_DOGSTATSD_PORT_DEFAULT;
 
         cb->timeout = 0;
         cb->log_http_error = 0;
@@ -696,6 +715,10 @@ static int wdog_config_node (oconfig_item_t *ci) /* {{{ */
                                 WARNING (PLUGIN_NAME " plugin: unable to parse tags. "
                                         "None will be reported - please check config..");
                         }
+                }
+                else if (strcasecmp ("Use_Dogstatsd", child->key) == 0) {
+                        cf_util_get_boolean (child, &cb->use_dogstatsd);
+
                 }
                 else if (strcasecmp ("VerifyPeer", child->key) == 0)
                         cf_util_get_boolean (child, &cb->verify_peer);
@@ -819,11 +842,28 @@ static int wdog_config (oconfig_item_t *ci) /* {{{ */
         return (0);
 } /* }}} int wdog_config */
 
+// Handler list...
+#define N_ENHANCED_PLUGINS 1
+struct dd_handler DD_HANDLERS[] = {
+        { "snmp", extract_ddtags_to_json }
+}
+
+
 static int wdog_init (void) /* {{{ */
 {
         /* Call this while collectd is still single-threaded to avoid
          * initialization issues in libgcrypt. */
+        int i = 0;
         curl_global_init (CURL_GLOBAL_SSL);
+        dd_custom_fn_map =  g_hash_table_new(g_str_hash, g_str_equal);
+
+        for (i=0 ; i<N_ENHANCED_PLUGINS ; i++){
+                g_hash_table_insert(
+                                dd_custom_fn_map,
+                                DD_HANDLERS[i].name,
+                                DD_HANDLERS[i].handler_fn
+                                );
+        }
         return (0);
 } /* }}} int wdog_init */
 
