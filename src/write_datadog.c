@@ -54,7 +54,7 @@
 #define DD_MAX_TAG_LEN 255
 
 
-typedef int (*custom_fn) (char, size_t, const data_set_t *, const value_list_t *, 
+typedef int (*custom_fn) (char *, size_t, const data_set_t *, const value_list_t *, 
                 const char * const *, int, _Bool);
 struct dd_handler {
         const char * name;
