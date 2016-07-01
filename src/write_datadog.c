@@ -118,7 +118,7 @@ int extract_ddtags_to_json(char *buffer, size_t buffer_size,
 #define N_ENHANCED_PLUGINS 1
 struct dd_handler DD_HANDLERS[] = {
         { "snmp", extract_ddtags_to_json }
-}
+};
 
 
 int svsnprintf (char *dest, size_t n, const char *format, va_list args)
