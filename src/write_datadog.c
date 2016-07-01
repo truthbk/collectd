@@ -584,7 +584,7 @@ static void wdog_callback_free (void *data) /* {{{ */
 static int wdog_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{ */
                 wdog_callback_t *cb)
 {
-        int i, status;
+        int status;
 
         pthread_mutex_lock (&cb->send_lock);
 
@@ -856,7 +856,7 @@ static int wdog_init (void) /* {{{ */
         for (i=0 ; i<N_ENHANCED_PLUGINS ; i++){
                 g_hash_table_insert(
                                 dd_custom_fn_map,
-                                DD_HANDLERS[i].name,
+                                (char *)DD_HANDLERS[i].name,
                                 DD_HANDLERS[i].handler_fn
                                 );
         }
