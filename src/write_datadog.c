@@ -110,7 +110,7 @@ typedef struct wdog_callback_s wdog_callback_t;
 // Handlers
 
 //Handler prototypes
-int extract_ddtags_to_json(char *buffer, size_t buffer_size,
+static int extract_ddtags_to_json(char *buffer, size_t buffer_size,
                 const data_set_t *ds, const value_list_t *vl,
                 const char * const * tags, int n_tags, _Bool device_tag);
 
