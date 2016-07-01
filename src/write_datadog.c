@@ -48,6 +48,8 @@
 #define PLUGIN_NAME "write_datadog"
 #define DD_BASE_URL "https://app.datadoghq.com/api/v1"
 
+#define COLLECTD_PREFIX "collectd"
+
 #define DD_DOGSTATSD_DEFAULT "localhost"
 #define DD_DOGSTATSD_PORT_DEFAULT 8125
 
@@ -207,6 +209,8 @@ static int extract_ddmetric_name_to_json(char *buffer, size_t buffer_size,
   memset (buffer, 0, buffer_size);
 
   status += buffer_add(buffer, buffer_size, &offset, "\"");
+  status += buffer_add(buffer, buffer_size, &offset, COLLECTD_PREFIX);
+  status += buffer_add(buffer, buffer_size, &offset, ".");
   status += buffer_add(buffer, buffer_size, &offset, vl->plugin);
   status += buffer_add(buffer, buffer_size, &offset, ".");
   status += buffer_add(buffer, buffer_size, &offset, vl->type);
