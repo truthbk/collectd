@@ -585,7 +585,6 @@ static int wdog_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{
                 wdog_callback_t *cb)
 {
         int i, status;
-        _Bool special_plugin_avail = 0;
 
         pthread_mutex_lock (&cb->send_lock);
 
@@ -598,17 +597,6 @@ static int wdog_write_json (const data_set_t *ds, const value_list_t *vl, /* {{{
                         pthread_mutex_unlock (&cb->send_lock);
                         return (-1);
                 }
-        }
-
-        for (i=0 ; i<N_ENHANCED_PLUGINS ; i++) {
-                if(strcasecmp(vl->plugin, DD_SUPPORTED_PLUGINS[i]) == 0) {
-                        special_plugin_avail = 1;
-                        break;
-                }
-        }
-
-        if(!special_plugin_avail) {
-                return (0); //do we have a better status?
         }
 
         status = generate_dd_json (cb, ds, vl);
