@@ -55,7 +55,7 @@
 
 
 typedef int (*custom_fn) (char, size_t, const data_set_t *, const value_list_t *, 
-                const char * const *, int, _Bool)
+                const char * const *, int, _Bool);
 struct dd_handler {
         const char * name;
         custom_fn handler_fn;
