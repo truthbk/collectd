@@ -107,6 +107,20 @@ struct wdog_callback_s
 };
 typedef struct wdog_callback_s wdog_callback_t;
 
+// Handlers
+
+//Handler prototypes
+int extract_ddtags_to_json(char *buffer, size_t buffer_size,
+                const data_set_t *ds, const value_list_t *vl,
+                const char * const * tags, int n_tags, _Bool device_tag);
+
+// Handler list
+#define N_ENHANCED_PLUGINS 1
+struct dd_handler DD_HANDLERS[] = {
+        { "snmp", extract_ddtags_to_json }
+}
+
+
 int svsnprintf (char *dest, size_t n, const char *format, va_list args)
 {
 	int ret = 0;
@@ -841,12 +855,6 @@ static int wdog_config (oconfig_item_t *ci) /* {{{ */
 
         return (0);
 } /* }}} int wdog_config */
-
-// Handler list...
-#define N_ENHANCED_PLUGINS 1
-struct dd_handler DD_HANDLERS[] = {
-        { "snmp", extract_ddtags_to_json }
-}
 
 
 static int wdog_init (void) /* {{{ */
