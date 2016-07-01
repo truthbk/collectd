@@ -1229,8 +1229,8 @@ pkglib_LTLIBRARIES += write_datadog.la
 write_datadog_la_SOURCES = write_datadog.c \
 			utils_format_json.c utils_format_json.h
 write_datadog_la_LDFLAGS = $(PLUGIN_LDFLAGS)
-write_datadog_la_CFLAGS = $(AM_CFLAGS)
-write_datadog_la_LIBADD =
+write_datadog_la_CFLAGS = $(AM_CFLAGS) -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include
+write_datadog_la_LIBADD = -L/usr/lib -lm -lglib-2.0
 if BUILD_WITH_LIBCURL
 write_datadog_la_CFLAGS += $(BUILD_WITH_LIBCURL_CFLAGS)
 write_datadog_la_LIBADD += $(BUILD_WITH_LIBCURL_LIBS)
